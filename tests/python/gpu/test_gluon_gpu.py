@@ -1,0 +1,924 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+from __future__ import print_function
+import sys
+import gc
+import os
+import tempfile
+import time
+import random
+import mxnet as mx
+import multiprocessing as mp
+from mxnet.test_utils import check_consistency, set_default_context, assert_almost_equal, rand_ndarray, environment
+import mxnet.ndarray as nd
+import numpy as np
+import math
+from mxnet import autograd
+
+curr_path = os.path.dirname(os.path.abspath(os.path.expanduser(__file__)))
+sys.path.insert(0, os.path.join(curr_path, '../unittest'))
+from common import setup_module, with_seed, teardown, assert_raises_cudnn_not_satisfied, run_in_spawned_process, random_seed
+from test_gluon import *
+from test_loss import *
+from test_gluon_rnn import *
+
+set_default_context(mx.gpu(0))
+
+
+def check_rnn_layer(layer):
+    layer.collect_params().initialize(ctx=[mx.cpu(0), mx.gpu(0)])
+    with mx.gpu(0):
+        x = mx.nd.ones((10, 16, 30))
+        states = layer.begin_state(16)
+        go, gs = layer(x, states)
+
+    with mx.cpu(0):
+        x = mx.nd.ones((10, 16, 30))
+        states = layer.begin_state(16)
+        co, cs = layer(x, states)
+
+    assert_almost_equal(go, co)
+    for g, c in zip(gs, cs):
+        assert_almost_equal(g, c)
+
+
+@with_seed()
+def check_rnn_layer_w_rand_inputs(layer):
+    layer.collect_params().initialize(ctx=[mx.cpu(0), mx.gpu(0)])
+    x = mx.nd.uniform(shape=(10, 16, 30))
+    with mx.gpu(0):
+        x = x.copyto(mx.gpu(0))
+        states = layer.begin_state(16)
+        go, gs = layer(x, states)
+
+    with mx.cpu(0):
+        x = x.copyto(mx.cpu(0))
+        states = layer.begin_state(16)
+        co, cs = layer(x, states)
+
+    assert_almost_equal(go, co)
+    for g, c in zip(gs, cs):
+        assert_almost_equal(g, c)
+
+
+@with_seed()
+@assert_raises_cudnn_not_satisfied(min_version='7.2.1')
+def test_lstmp():
+    hidden_size, projection_size = 3, 2
+    rtol, atol = 1e-2, 1e-2
+    batch_size, seq_len = 7, 11
+    input_size = 5
+    ctx = mx.gpu(0)
+    lstm_input = mx.nd.uniform(
+        shape=(seq_len, batch_size, input_size), ctx=ctx)
+    shapes = {'i2h_weight': (hidden_size * 4, input_size),
+              'h2h_weight': (hidden_size * 4, projection_size),
+              'i2h_bias': (hidden_size * 4,),
+              'h2h_bias': (hidden_size * 4,),
+              'h2r_weight': (projection_size, hidden_size)}
+    weights = {k: rand_ndarray(v) for k, v in shapes.items()}
+    lstm_layer = gluon.rnn.LSTM(hidden_size, projection_size=projection_size,
+                                input_size=input_size, prefix='lstm0_')
+    lstm_cell = gluon.contrib.rnn.LSTMPCell(hidden_size=hidden_size,
+                                            projection_size=projection_size,
+                                            input_size=input_size,
+                                            prefix='lstm0_l0_')
+    lstm_layer.initialize(ctx=ctx)
+    lstm_cell.initialize(ctx=ctx)
+    layer_params = lstm_layer.collect_params()
+    cell_params = lstm_cell.collect_params()
+    for k, v in weights.items():
+        layer_params['lstm0_l0_' + k].set_data(v.copy())
+        cell_params['lstm0_l0_' + k].set_data(v.copy())
+    with autograd.record():
+        layer_output = lstm_layer(lstm_input.copy())
+        cell_output = lstm_cell.unroll(seq_len, lstm_input.copy(), layout='TNC',
+                                       merge_outputs=True)[0]
+
+    assert_almost_equal(layer_output, cell_output, rtol=rtol, atol=atol)
+    layer_output.backward()
+    cell_output.backward()
+    for k, v in weights.items():
+        layer_grad = layer_params['lstm0_l0_' + k].grad()
+        cell_grad = cell_params['lstm0_l0_' + k].grad()
+        print('checking gradient for {}'.format('lstm0_l0_' + k))
+        assert_almost_equal(layer_grad, cell_grad, rtol=rtol, atol=atol)
+    check_rnn_layer_forward(gluon.rnn.LSTM(
+        10, 2, projection_size=5), mx.nd.ones((8, 3, 20)), ctx=ctx)
+    check_rnn_layer_forward(gluon.rnn.LSTM(10, 2, projection_size=5, bidirectional=True), mx.nd.ones(
+        (8, 3, 20)), [mx.nd.ones((4, 3, 5)), mx.nd.ones((4, 3, 10))], ctx=ctx)
+    check_rnn_layer_forward(gluon.rnn.LSTM(10, 2, dropout=0.5, projection_size=5), mx.nd.ones((8, 3, 20)),
+                            run_only=True, ctx=ctx)
+    check_rnn_layer_forward(gluon.rnn.LSTM(10, 2, bidirectional=True, dropout=0.5, projection_size=5),
+                            mx.nd.ones((8, 3, 20)),
+                            [mx.nd.ones((4, 3, 5)), mx.nd.ones((4, 3, 10))], run_only=True, ctx=ctx)
+    lstm_layer.save_parameters('gpu_tmp.params')
+    lstm_layer.load_parameters('gpu_tmp.params')
+
+
+@with_seed()
+@assert_raises_cudnn_not_satisfied(min_version='7.2.1')
+def test_lstm_clip():
+
+    class OnesDiag(mx.init.Initializer):
+        """Initializes the diagonal of a potentially rectangular 2D array to 1's with the rest 0's
+        """
+        def __init__(self):
+            super(OnesDiag, self).__init__()
+
+        def _init_weight(self, _, arr):
+            arr[:] = 0
+            min_size = min(arr.shape[0], arr.shape[1])
+            for i in range(min_size):
+                arr[i,i] = 1
+
+    # CuDNN clips the hidden state before the recurrent projection, so the output states may
+    # exceed the clipped range.  However, a projection matrix with 1's along the diagonal will
+    # pass the first 'projection_size' elements intact, and thus give evidence that the
+    # clipping is being performed.  Sadly the projection_size must be strictly less than
+    # the hidden_size, so full hidden state visibility is not possible with projection enabled.
+    hidden_size, projection_size = 2049, 2048
+    batch_size, seq_len = 32, 80
+    input_size = 50
+    clip_min, clip_max, clip_nan = -5, 5, True
+    lstm_input = mx.nd.uniform(
+        shape=(seq_len, batch_size, input_size), ctx=mx.gpu(0))
+    lstm_states = [mx.nd.uniform(shape=(2, batch_size, projection_size), ctx=mx.gpu(0)),
+                   mx.nd.uniform(shape=(2, batch_size, hidden_size), ctx=mx.gpu(0))]
+    lstm_layer = gluon.rnn.LSTM(hidden_size, projection_size=projection_size,
+                                input_size=input_size, prefix='lstm0_',
+                                h2r_weight_initializer=OnesDiag(),
+                                bidirectional=True,
+                                state_clip_min=clip_min,
+                                state_clip_max=clip_max,
+                                state_clip_nan=clip_nan)
+    lstm_layer.initialize(ctx=mx.gpu(0))
+    with autograd.record():
+        _, layer_output_states = lstm_layer(lstm_input, lstm_states)
+    cell_states = layer_output_states[0].asnumpy()
+    assert (cell_states >= clip_min).all() and (cell_states <= clip_max).all()
+    assert not np.isnan(cell_states).any()
+
+
+@with_seed()
+@assert_raises_cudnn_not_satisfied(min_version='5.1.10')
+def test_rnn_layer():
+    check_rnn_layer(gluon.rnn.RNN(100, num_layers=3))
+    check_rnn_layer(gluon.rnn.RNN(100, activation='tanh', num_layers=3))
+    check_rnn_layer(gluon.rnn.LSTM(100, num_layers=3))
+    check_rnn_layer(gluon.rnn.GRU(100, num_layers=3))
+
+    check_rnn_layer(gluon.rnn.LSTM(100, num_layers=3, bidirectional=True))
+    check_rnn_layer_w_rand_inputs(gluon.rnn.LSTM(
+        100, num_layers=3, bidirectional=True))
+
+
+def check_layer_bidirectional(size, in_size, proj_size):
+    class RefBiLSTM(gluon.Block):
+        def __init__(self, size, proj_size, **kwargs):
+            super(RefBiLSTM, self).__init__(**kwargs)
+            with self.name_scope():
+                self._lstm_fwd = gluon.rnn.LSTM(
+                    size, projection_size=proj_size, bidirectional=False, prefix='l0')
+                self._lstm_bwd = gluon.rnn.LSTM(
+                    size, projection_size=proj_size, bidirectional=False, prefix='r0')
+
+        def forward(self, inpt):
+            fwd = self._lstm_fwd(inpt)
+            bwd_inpt = nd.flip(inpt, 0)
+            bwd = self._lstm_bwd(bwd_inpt)
+            bwd = nd.flip(bwd, 0)
+            return nd.concat(fwd, bwd, dim=2)
+    weights = {}
+    for d in ['l', 'r']:
+        weights['lstm_{}0_i2h_weight'.format(d)] = mx.random.uniform(
+            shape=(size * 4, in_size))
+        if proj_size:
+            weights['lstm_{}0_h2h_weight'.format(d)] = mx.random.uniform(
+                shape=(size * 4, proj_size))
+            weights['lstm_{}0_h2r_weight'.format(d)] = mx.random.uniform(
+                shape=(proj_size, size))
+        else:
+            weights['lstm_{}0_h2h_weight'.format(
+                d)] = mx.random.uniform(shape=(size * 4, size))
+        weights['lstm_{}0_i2h_bias'.format(
+            d)] = mx.random.uniform(shape=(size * 4,))
+        weights['lstm_{}0_h2h_bias'.format(
+            d)] = mx.random.uniform(shape=(size * 4,))
+
+    net = gluon.rnn.LSTM(size, projection_size=proj_size,
+                         bidirectional=True, prefix='lstm_')
+    ref_net = RefBiLSTM(size, proj_size, prefix='lstm_')
+    net.initialize()
+    ref_net.initialize()
+    net_params = net.collect_params()
+    ref_net_params = ref_net.collect_params()
+    for k in weights:
+        net_params[k].set_data(weights[k])
+        ref_net_params[k.replace('l0', 'l0l0').replace(
+            'r0', 'r0l0')].set_data(weights[k])
+
+    data = mx.random.uniform(shape=(11, 10, in_size))
+    mx.test_utils.assert_allclose(net(data), ref_net(data), rtol=1e-6)
+
+
+
+def check_layer_bidirectional_varseqlen(size, in_size):
+    weights = {}
+    for d in ['l', 'r']:
+        weights['lstm_{}0_i2h_weight'.format(d)] = mx.random.uniform(shape=(size*4, in_size))
+        weights['lstm_{}0_h2h_weight'.format(d)] = mx.random.uniform(shape=(size*4, size))
+        weights['lstm_{}0_i2h_bias'.format(d)] = mx.random.uniform(shape=(size*4,))
+        weights['lstm_{}0_h2h_bias'.format(d)] = mx.random.uniform(shape=(size*4,))
+
+    net = gluon.rnn.LSTM(size, bidirectional=True, use_sequence_length=True, prefix='lstm_')
+    ref_net  = gluon.rnn.LSTM(size, bidirectional=True, use_sequence_length=False, prefix='lstm_ref_')
+    net.initialize()
+    ref_net.initialize()
+    net_params = net.collect_params()
+    ref_net_params = ref_net.collect_params()
+    for k in weights:
+        net_params[k].set_data(weights[k])
+        ref_net_params[k.replace("lstm_", "lstm_ref_")].set_data(weights[k])
+
+    batch_size = 10
+    num_timesteps = 11
+    data = mx.random.uniform(shape=(num_timesteps, batch_size, in_size))
+    data_np = data.asnumpy()
+
+    sequence_length = nd.random.randint(1, num_timesteps+1, shape=(batch_size)).astype("int32")
+    sequence_length_np = sequence_length.asnumpy().astype("int32")
+
+    # Reference net is processing batch elements one at a time, so that it is "perfectly sized"
+    # Because of that, we need to accumulate gradients in reference net.
+    for p in ref_net.collect_params().values():
+        p.grad_req = 'add'
+
+    ref_net_output = []
+    with autograd.record():
+        net_output = net(data.copy(), sequence_length=sequence_length.copy())
+
+        for b in range(batch_size):
+            data_slice = mx.nd.array(data_np[:sequence_length_np[b], b, :]).reshape(sequence_length_np[b], 1, in_size)
+            ref_output_slice = ref_net(data_slice)
+            ref_net_output.append(ref_output_slice)
+
+    net_output_np = net_output.asnumpy()
+
+    # TODO: test state return value as well output
+    # Only compare the valid sections for each batch entry
+    for b in range(batch_size):
+        assert_allclose(net_output_np[:sequence_length_np[b], b], ref_net_output[b].asnumpy().squeeze(1),
+                        rtol=1e-2, atol=1e-6)
+
+    # Now test backward
+    net_output.backward()
+
+    for ref_output_slice in ref_net_output:
+        ref_output_slice.backward()
+
+    ref_net_params = ref_net.collect_params()
+
+    for k in weights:
+        net_grad = net_params[k].grad()
+        ref_net_grad = ref_net_params[k.replace('lstm_', 'lstm_ref_')].grad()
+        assert_almost_equal(net_grad.asnumpy(), ref_net_grad.asnumpy(),
+                            rtol=1e-2, atol=1e-6)
+
+
+@with_seed()
+@assert_raises_cudnn_not_satisfied(min_version='5.1.10')
+def test_layer_bidirectional():
+    check_layer_bidirectional(7, 5, 0)
+
+
+@with_seed()
+@assert_raises_cudnn_not_satisfied(min_version='7.2.1')
+def test_layer_bidirectional_proj():
+    check_layer_bidirectional(7, 5, 3)
+
+@with_seed()
+@assert_raises_cudnn_not_satisfied(min_version='7.2.1')
+def test_layer_bidirectional_varseqlength():
+    check_layer_bidirectional_varseqlen(7, 5)
+
+
+@with_seed()
+@assert_raises_cudnn_not_satisfied(min_version='5.1.10')
+def test_rnn_layer_begin_state_type():
+    fake_data = nd.random.uniform(shape=(3, 5, 7), dtype='float16')
+    modeling_layer = gluon.rnn.LSTM(
+        hidden_size=11, num_layers=2, dropout=0.2, bidirectional=True)
+    modeling_layer.cast('float16')
+    modeling_layer.initialize()
+    modeling_layer(fake_data)
+
+
+def test_gluon_ctc_consistency():
+    loss = mx.gluon.loss.CTCLoss()
+    data = mx.nd.arange(0, 4, repeat=40, ctx=mx.gpu(0)
+                        ).reshape((2, 20, 4)).flip(axis=0)
+    cpu_label = mx.nd.array([[2, 1, -1, -1], [3, 2, 2, -1]], ctx=mx.cpu(0))
+    gpu_label = mx.nd.array([[2, 1, -1, -1], [3, 2, 2, -1]], ctx=mx.gpu(0))
+
+    cpu_data = data.copy().as_in_context(mx.cpu(0))
+    cpu_data.attach_grad()
+    with mx.autograd.record():
+        l_cpu = loss(cpu_data, cpu_label)
+        l_cpu.backward()
+
+    gpu_data = data.copyto(mx.gpu(0))
+    gpu_data.attach_grad()
+    with mx.autograd.record():
+        l_gpu = loss(gpu_data, gpu_label)
+        l_gpu.backward()
+
+    assert_almost_equal(cpu_data.grad, gpu_data.grad, atol=1e-3, rtol=1e-3)
+
+
+@with_seed()
+def test_global_norm_clip_multi_device():
+    for check_isfinite in [True, False]:
+        x1 = mx.nd.ones((3, 3), ctx=mx.gpu(0))
+        x2 = mx.nd.ones((4, 4), ctx=mx.cpu(0))
+        norm = gluon.utils.clip_global_norm(
+            [x1, x2], 1.0, check_isfinite=check_isfinite)
+        if check_isfinite:
+            assert norm == 5.0
+        else:
+            assert norm.asscalar() == 5.0
+        assert_almost_equal(x1, np.ones((3, 3)) / 5)
+        assert_almost_equal(x2, np.ones((4, 4)) / 5)
+
+
+def _check_batchnorm_result(input, num_devices=1, cuda=False):
+    from mxnet.gluon.utils import split_and_load
+    def _find_bn(module):
+        if isinstance(module, (mx.gluon.nn.BatchNorm, mx.gluon.contrib.nn.SyncBatchNorm)):
+            return module
+        elif isinstance(module.module, (mx.gluon.nn.BatchNorm, mx.gluon.contrib.nn.SyncBatchNorm)):
+            return module.module
+
+        raise RuntimeError('BN not found')
+
+    def _syncParameters(bn1, bn2, ctx):
+        ctx = input.context
+        bn2.gamma.set_data(bn1.gamma.data(ctx))
+        bn2.beta.set_data(bn1.beta.data(ctx))
+        bn2.running_mean.set_data(bn1.running_mean.data(ctx))
+        bn2.running_var.set_data(bn1.running_var.data(ctx))
+
+    input1 = input.copy()
+    input2 = input.copy()
+
+    if cuda:
+        input1 = input.as_in_context(mx.gpu(0))
+        ctx_list = [mx.gpu(i) for i in range(num_devices)]
+    else:
+        ctx_list = [mx.cpu(0) for _ in range(num_devices)]
+
+    nch = input.shape[1]
+    bn1 = mx.gluon.nn.BatchNorm(in_channels=nch)
+    bn2 = mx.gluon.contrib.nn.SyncBatchNorm(in_channels=nch, num_devices=num_devices)
+
+    bn1.initialize(ctx=ctx_list[0])
+    bn2.initialize(ctx=ctx_list)
+
+    # using the same values for gamma and beta
+    #_syncParameters(_find_bn(bn1), _find_bn(bn2), ctx_list[0])
+
+    input1.attach_grad()
+    inputs2 = split_and_load(input2, ctx_list, batch_axis=0)
+    for xi in inputs2:
+        xi.attach_grad()
+
+    with mx.autograd.record():
+        output1 = bn1(input1)
+        output2  = [bn2(xi) for xi in inputs2]
+        loss1 = (output1 ** 2).sum()
+        loss2 = [(output ** 2).sum() for output in output2]
+        mx.autograd.backward(loss1)
+        mx.autograd.backward(loss2)
+
+    output2 = mx.nd.concat(*[output.as_in_context(input.context) for output in output2], dim=0)
+    # assert forwarding
+    assert_almost_equal(input1, input2, atol=1e-3, rtol=1e-3)
+    assert_almost_equal(output1, output2, atol=1e-3, rtol=1e-3)
+    assert_almost_equal(_find_bn(bn1).running_mean.data(ctx_list[0]),
+                        _find_bn(bn2).running_mean.data(ctx_list[0]),
+                        atol=1e-3, rtol=1e-3)
+    assert_almost_equal(_find_bn(bn1).running_var.data(ctx_list[0]),
+                        _find_bn(bn2).running_var.data(ctx_list[0]),
+                        atol=1e-3, rtol=1e-3)
+    input2grad = mx.nd.concat(*[output.grad.as_in_context(input.context) for output in inputs2], dim=0)
+    assert_almost_equal(input1.grad, input2grad, atol=1e-3, rtol=1e-3)
+
+@with_seed()
+def test_sync_batchnorm():
+    num_devices = mx.context.num_gpus()
+
+    # no need to use SyncBN with 1 gpu
+    if num_devices < 2:
+        sys.stderr.write('bypassing test: needs 2 or more gpus, found {} ...'.format(num_devices))
+        return
+    ndev = 2
+    # check with unsync version
+    for i in range(10):
+        _check_batchnorm_result(mx.nd.random.uniform(shape=(4, 1, 4, 4)),
+                                num_devices=ndev, cuda=True)
+
+    bn1.initialize(ctx=ctx_list[0])
+    bn2.initialize(ctx=ctx_list)
+
+    # using the same values for gamma and beta
+    #_syncParameters(_find_bn(bn1), _find_bn(bn2), ctx_list[0])
+
+    input1.attach_grad()
+    inputs2 = split_and_load(input2, ctx_list, batch_axis=0)
+    for xi in inputs2:
+        xi.attach_grad()
+
+    with mx.autograd.record():
+        output1 = bn1(input1)
+        output2  = [bn2(xi) for xi in inputs2]
+        loss1 = (output1 ** 2).sum()
+        loss2 = [(output ** 2).sum() for output in output2]
+        mx.autograd.backward(loss1)
+        mx.autograd.backward(loss2)
+
+    output2 = mx.nd.concat(*[output.as_in_context(input.context) for output in output2], dim=0)
+    # assert forwarding
+    assert_almost_equal(input1, input2, atol=1e-3, rtol=1e-3)
+    assert_almost_equal(output1, output2, atol=1e-3, rtol=1e-3)
+    assert_almost_equal(_find_bn(bn1).running_mean.data(ctx_list[0]),
+                        _find_bn(bn2).running_mean.data(ctx_list[0]),
+                        atol=1e-3, rtol=1e-3)
+    assert_almost_equal(_find_bn(bn1).running_var.data(ctx_list[0]),
+                        _find_bn(bn2).running_var.data(ctx_list[0]),
+                        atol=1e-3, rtol=1e-3)
+    input2grad = mx.nd.concat(*[output.grad.as_in_context(input.context) for output in inputs2], dim=0)
+    assert_almost_equal(input1.grad, input2grad, atol=1e-3, rtol=1e-3)
+
+@with_seed()
+def test_sync_batchnorm():
+    def get_num_devices():
+        for i in range(100):
+            try:
+                mx.nd.zeros((1,), ctx=mx.gpu(i))
+            except:
+                return i
+    # no need to use SyncBN with 1 gpu
+    if get_num_devices() < 2:
+        return
+    ndev = 2
+    # check with unsync version
+    for i in range(10):
+        _check_batchnorm_result(mx.nd.random.uniform(shape=(4, 1, 4, 4)),
+                                num_devices=ndev, cuda=True)
+
+@with_seed()
+def test_symbol_block_fp16():
+    # Test case to verify if initializing the SymbolBlock from a model with params
+    # other than fp32 param dtype.
+
+    # 1. Load a resnet model, cast it to fp16 and export
+    tmp = tempfile.mkdtemp()
+    tmpfile = os.path.join(tmp, 'resnet34_fp16')
+    ctx = mx.gpu(0)
+
+    net_fp32 = mx.gluon.model_zoo.vision.resnet34_v2(
+        pretrained=True, ctx=ctx, root=tmp)
+    net_fp32.cast('float16')
+    net_fp32.hybridize()
+    data = mx.nd.zeros((1, 3, 224, 224), dtype='float16', ctx=ctx)
+    net_fp32.forward(data)
+    net_fp32.export(tmpfile, 0)
+
+    # 2. Load the saved model and verify if all the params are loaded correctly.
+    # and choose one of the param to verify the type if fp16.
+    sm = mx.sym.load(tmpfile + '-symbol.json')
+    inputs = mx.sym.var('data', dtype='float16')
+    net_fp16 = mx.gluon.SymbolBlock(sm, inputs)
+    net_fp16.collect_params().load(tmpfile + '-0000.params', ctx=ctx)
+    # 3. Get a conv layer's weight parameter name. Conv layer's weight param is
+    # expected to be of dtype casted, fp16.
+    for param_name in net_fp16.params.keys():
+        if 'conv' in param_name and 'weight' in param_name:
+            break
+    assert np.dtype(net_fp16.params[param_name].dtype) == np.dtype(np.float16)
+
+
+@with_seed()
+def test_large_models_low_cpu_mem_usage():
+    ctx = default_context()
+    # Create model
+    net = gluon.nn.HybridSequential()
+
+    largest_num_features = 256
+    with net.name_scope():
+        net.add(nn.Conv2D(largest_num_features, 3, cudnn_algo_verbose=1))
+        # Use a second convolution to reduce the size of the output to reduce use of CPU memory
+        net.add(nn.Conv2D(1, 1))
+
+    net.hybridize()
+    net.initialize(mx.init.Normal(sigma=0.01), ctx=ctx)
+
+    # Compute the height (=width) of the square tensor of the given size in bytes
+    def tensor_size(big_tensor_bytes):
+        bytes_per_float = 4
+        cudnn_tensor_elements_max = 2 * 1024 * 1024 * 1024 - 1
+        tensor_elements = min(big_tensor_bytes / bytes_per_float, cudnn_tensor_elements_max)
+        sz = int(math.sqrt(tensor_elements / largest_num_features))
+        return (sz // 100) * 100
+
+    # The idea is to create models with large tensors of (say) 20% of the total memory.
+    # This in the past has given cudnnFind() trouble when it needed to allocate similar I/O's
+    # from the area carved out by the MXNET_GPU_MEM_POOL_RESERVE setting (by default 5%).
+    (free_mem_bytes, total_mem_bytes) = mx.context.gpu_memory_info(ctx.device_id)
+    # This test needs to be 'qualified' for use with each new larger memory size
+    largest_supported_total_mem_GB = 32
+    if (total_mem_bytes > largest_supported_total_mem_GB * 1024 * 1024 * 1024):
+        sys.stderr.write(
+        ' bypassing test due to too-large global memory of size {} ... '.format(total_mem_bytes))
+        return
+
+    start_size = tensor_size(0.20 * total_mem_bytes)
+    num_trials = 10
+    sys.stderr.write(
+        ' testing global memory of size {} ... '.format(total_mem_bytes))
+    sys.stderr.flush()
+    for i in range(num_trials):
+        sz = start_size - 10 * i
+        (height, width) = (sz, sz)
+        sys.stderr.write(" {}x{} ".format(height, width))
+        sys.stderr.flush()
+        data_in = nd.random_uniform(low=0, high=255, shape=(1, 3, height, width),
+                                    ctx=ctx, dtype="float32")
+        # Evaluate model
+        start = time.time()
+        net(data_in).asnumpy()
+        end = time.time()
+        gc.collect()
+        duration = end - start
+        gc_duration = time.time() - end
+        print('times for (model, gc) in secs = ({:.4f}, {:.4f})'.format(duration, gc_duration))
+
+@unittest.skip("Test runtime can grow 10X on some systems.  Prefer test_large_models_low_cpu_mem_usage above.")
+@with_seed()
+def test_large_models():
+    ctx = default_context()
+    # Create model
+    net = gluon.nn.HybridSequential()
+
+    largest_num_features = 256
+    with net.name_scope():
+        net.add(nn.Conv2D(largest_num_features, 3, cudnn_algo_verbose=1))
+
+    net.hybridize()
+    net.initialize(mx.init.Normal(sigma=0.01), ctx=ctx)
+
+    # Compute the height (=width) of the square tensor of the given size in bytes
+    def tensor_size(big_tensor_bytes):
+        bytes_per_float = 4
+        cudnn_tensor_elements_max = 2 * 1024 * 1024 * 1024 - 1
+        tensor_elements = min(big_tensor_bytes / bytes_per_float, cudnn_tensor_elements_max)
+        sz = int(math.sqrt(tensor_elements / largest_num_features))
+        return (sz // 100) * 100
+
+    # The idea is to create models with large tensors of (say) 20% of the total memory.
+    # This in the past has given cudnnFind() trouble when it needed to allocate similar I/O's
+    # from the area carved out by the MXNET_GPU_MEM_POOL_RESERVE setting (by default 5%).
+    (free_mem_bytes, total_mem_bytes) = mx.context.gpu_memory_info(ctx.device_id)
+    # This test needs to be 'qualified' for use with each new larger memory size
+    largest_supported_total_mem_GB = 32
+    if (total_mem_bytes > largest_supported_total_mem_GB * 1024 * 1024 * 1024):
+        sys.stderr.write(
+        ' bypassing test due to too-large global memory of size {} ... '.format(total_mem_bytes))
+        return
+
+    start_size = tensor_size(0.20 * total_mem_bytes)
+    num_trials = 10
+    sys.stderr.write(
+        ' testing global memory of size {} ... '.format(total_mem_bytes))
+    sys.stderr.flush()
+    for i in range(num_trials):
+        sz = start_size - 10 * i
+        (height, width) = (sz, sz)
+        sys.stderr.write(" {}x{} ".format(height, width))
+        sys.stderr.flush()
+        data_in = nd.random_uniform(low=0, high=255, shape=(1, 3, height, width),
+                                    ctx=ctx, dtype="float32")
+        # Evaluate model
+        start = time.time()
+        net(data_in).asnumpy()
+        end = time.time()
+        gc.collect()
+        duration = end - start
+        gc_duration = time.time() - end
+        print('times for (model, gc) in secs = ({:.4f}, {:.4f})'.format(duration, gc_duration))
+
+
+def _test_cuda_graphs(seed):
+    ctx = default_context()
+
+    def get_net(num_ops, kernel_size, data_shape):
+        (_, in_channels, _, _) = data_shape
+        pad = (kernel_size - 1) // 2
+        net = nn.HybridSequential()
+        out_channels = in_channels
+        with net.name_scope():
+            for _ in range(num_ops):
+                net.add(nn.Conv2D(channels=out_channels,
+                                  kernel_size=(kernel_size,kernel_size),
+                                  padding=(pad,pad),
+                                  layout='NHWC',
+                                  in_channels=in_channels))
+        net.hybridize(static_alloc=True, static_shape=True)
+        net.initialize(mx.init.Normal(sigma=0.01), ctx=ctx)
+        return net
+
+    # Note that CUDA Graph creation is normally triggered on the 2nd iteration
+    def exercise_net(net, data_shape, iterations=2):
+        (n, c, h, w) = data_shape
+        nhwc_data_shape = (n, h, w, c)
+        out_shape = nhwc_data_shape
+        x = mx.ndarray.zeros(nhwc_data_shape)
+        x.attach_grad()
+        dy = mx.ndarray.ones(out_shape)
+        for i in range(iterations):
+            with autograd.record():
+                start = time.time()
+                y = net(x)
+            y.backward(dy)
+            x.grad.wait_to_read()
+        return
+
+    data_shape1 = (1, 10, 100, 100)
+    net1 = get_net(num_ops=25, kernel_size=3, data_shape=data_shape1)
+    exercise_net(net1, data_shape1, 4)
+    data_shape2 = (1, 10, 200, 200)
+    net2 = get_net(num_ops=25, kernel_size=3, data_shape=data_shape2)
+    exercise_net(net2, data_shape2, 4)
+
+    # Captured temp workspaces of exe1 are now invalid, because the temp workspace size
+    # grew with exe2.  Running exe1 may still work since the exe1 workspace was not really
+    # freed from the gpu driver's perspective- it's in MXNet's memory pool.
+    exercise_net(net1, data_shape1, 4)
+
+    # Trigger the freeing of the memory pool due to memory exhaustion.  This should
+    # invalidate any captured temp space areas that were part of the memory pool.
+    (free_mem_bytes, total_mem_bytes) = mx.context.gpu_memory_info(ctx.device_id)
+    init_size_MB = 50
+    max_size_MB = 1000
+    for size_MB in range(init_size_MB, max_size_MB, 2):
+        last_free_mem_bytes = free_mem_bytes
+        (free_mem_bytes, total_mem_bytes) = mx.context.gpu_memory_info(ctx.device_id)
+        # When the free memory area jumps higher, it means the MXNet memory pool was released.
+        if (free_mem_bytes > last_free_mem_bytes):
+            break
+        data_shape = (size_MB * 1024 * 1024 // np.dtype(np.float32).itemsize,)
+        # Allocate and free an ndarray to ultimately force MXNet to 'ReleaseAll' its pool.
+        x = mx.nd.zeros(data_shape, dtype='float32', ctx=ctx)
+        x = None
+
+    # Now that the MXNet-maintained free pool has been released, the captured stale tempspace
+    # pointers in exe1 are even more likely to cause a crash.
+    exercise_net(net1, data_shape1, 4)
+    # This should always work since exe2 tempspace pointers are still valid
+    exercise_net(net2, data_shape2, 4)
+
+@with_seed()
+def test_cuda_graphs():
+    for num_threads in ['1', '2']:
+        for num_streams in ['1', '2']:
+            run_in_spawned_process(_test_cuda_graphs,
+                               {'MXNET_GPU_WORKER_NTHREADS' : num_threads,
+                                'MXNET_GPU_WORKER_NSTREAMS' : num_streams,
+                                'MXNET_ENABLE_CUDA_GRAPHS' : '1'})
+
+@with_seed()
+def test_hybridblock_mix_ctx_raise():
+    class FooHybrid(gluon.HybridBlock):
+        def hybrid_forward(self, F, a, b):
+            if isinstance(a, (list, tuple)):
+                a = sum(a)
+            if isinstance(b, (list, tuple)):
+                b = sum(b)
+            return a + b
+    foo_hybrid = FooHybrid()
+    foo_hybrid.hybridize()
+    assert_raises(ValueError, lambda: foo_hybrid(mx.nd.ones((10,), ctx=mx.gpu()),
+                                                 mx.nd.ones((10,), ctx=mx.cpu())))
+
+@with_seed()
+def test_symbol_block_symbolic_bn_fp16_cast():
+    with mx.gpu(0):
+        net = mx.gluon.nn.HybridSequential()
+        sym = mx.sym.var('data')
+        conv = mx.sym.Convolution(sym, kernel=(3, 3), num_filter=16)
+        bn = mx.sym.BatchNorm(conv, name='bn_test')
+        internals = bn.get_internals()
+        net.add(mx.gluon.nn.SymbolBlock([internals['bn_test_output']], [mx.sym.var('data')]))
+        net.add(mx.gluon.nn.Conv2D(10, kernel_size=1))
+        net.initialize()
+        x = mx.nd.zeros((1, 3, 32, 32), dtype='float32')
+        y = net(x)
+        assert np.dtype(y.dtype).name == 'float32'
+        net.cast('float16')
+        x = x.astype('float16')
+        y1 = net(x)
+        assert np.dtype(y1.dtype).name == 'float16'
+
+@with_seed()
+def test_cast_heterogeneous_ops_fp16():
+    with mx.gpu(0):
+        net = mx.gluon.nn.HybridSequential()
+        net.add(mx.gluon.nn.BatchNorm())
+        net.add(mx.gluon.nn.InstanceNormV2())
+        net.initialize()
+        x = mx.nd.zeros((1, 3, 32, 32), dtype='float32')
+        y = net(x)
+        assert np.dtype(y.dtype).name == 'float32'
+        net.cast('float16')
+        x = x.astype('float16')
+        y1 = net(x)
+        assert np.dtype(y1.dtype).name == 'float16'
+
+@with_seed()
+def test_gemms_true_fp16():
+    ctx = mx.gpu(0)
+    input = mx.nd.random.uniform(shape=(1, 512), dtype='float16', ctx=ctx)
+    weights = mx.nd.random.uniform(shape=(128, 512), ctx=ctx)
+
+    net = nn.Dense(128, in_units=512, use_bias=False)
+    net.cast('float16')
+    net.initialize(ctx=ctx)
+    net.weight.set_data(weights)
+
+    with environment('MXNET_FC_TRUE_FP16', '0'):
+      ref_results = net(input)
+
+    with environment('MXNET_FC_TRUE_FP16', '1'):
+      results_trueFP16 = net(input)
+
+    atol = 1e-2
+    rtol = 1e-2
+    assert_almost_equal(ref_results.asnumpy(), results_trueFP16.asnumpy(),
+                        atol=atol, rtol=rtol)
+
+@with_seed()
+def test_cuda_graphs():
+    class GraphTester(gluon.HybridBlock):
+        def __init__(self, function_to_test, **kwargs):
+            super(GraphTester, self).__init__(**kwargs)
+            with self.name_scope():
+                self.f = function_to_test()
+
+        def hybrid_forward(self, F, *args):
+            # We need to isolate the operation to be fully inside the graph
+            # in order for graphs usage to be possible
+            copied_args = [F.identity(a) for a in args]
+            outputs = self.f(*copied_args)
+            if isinstance(outputs, (list, tuple)):
+                return [F.identity(o) for o in outputs]
+            else:
+                return F.identity(outputs)
+
+    class TestDesc:
+        def __init__(self, name, f, num_inputs=1, input_dim=4):
+            self.name = name
+            self.f = f
+            self.num_inputs = num_inputs
+            self.input_dim = input_dim
+
+        def generate_inputs(self):
+            shape = tuple(np.random.randint(4, 11, size=self.input_dim))
+            ret = [mx.random.uniform(shape=shape) for _ in range(self.num_inputs)]
+            for r in ret:
+                r.attach_grad()
+            return ret
+
+    tested_ops = [
+            TestDesc('add', lambda: (lambda x, y: x + y), num_inputs = 2),
+            TestDesc('add_scalar', lambda: (lambda x: x + 0.5)),
+            TestDesc('Conv', lambda: mx.gluon.nn.Conv2D(channels=32, kernel_size=(1,1))),
+            TestDesc('ConvTranspose', lambda: mx.gluon.nn.Conv2DTranspose(channels=32, kernel_size=(1,1))),
+            TestDesc('Dense', lambda: mx.gluon.nn.Dense(units=128)),
+            TestDesc('Activation', lambda: mx.gluon.nn.Activation('tanh')),
+            #TestDesc('Dropout', lambda: mx.gluon.nn.Dropout(0.5)),
+            TestDesc('Flatten', lambda: mx.gluon.nn.Flatten()),
+            TestDesc('MaxPool', lambda: mx.gluon.nn.MaxPool2D()),
+            TestDesc('AvgPool', lambda: mx.gluon.nn.AvgPool2D()),
+            TestDesc('GlobalMaxPool', lambda: mx.gluon.nn.GlobalMaxPool2D()),
+            TestDesc('GlobalAvgPool', lambda: mx.gluon.nn.GlobalAvgPool2D()),
+            TestDesc('ReflectionPad2D', lambda: mx.gluon.nn.ReflectionPad2D()),
+            TestDesc('BatchNorm', lambda: mx.gluon.nn.BatchNorm()),
+            TestDesc('InstanceNorm', lambda: mx.gluon.nn.InstanceNorm()),
+            TestDesc('LayerNorm', lambda: mx.gluon.nn.LayerNorm()),
+            TestDesc('LeakyReLU', lambda: mx.gluon.nn.LeakyReLU(0.1)),
+            TestDesc('PReLU', lambda: mx.gluon.nn.PReLU()),
+            TestDesc('ELU', lambda: mx.gluon.nn.ELU()),
+            TestDesc('SELU', lambda: mx.gluon.nn.SELU()),
+            TestDesc('Swish', lambda: mx.gluon.nn.Swish()),
+        ]
+
+    N = 10
+
+    with environment({'MXNET_ENABLE_CUDA_GRAPHS': '1',
+                      'MXNET_USE_FUSION': '0'}):
+        for test_desc in tested_ops:
+            print("Testing ", test_desc.name)
+            inputs = test_desc.generate_inputs()
+            inputsg = [i.copy() for i in inputs]
+            for i in inputsg:
+                i.attach_grad()
+            seed = random.randint(0, 10000)
+            net = GraphTester(test_desc.f)
+            netg = GraphTester(test_desc.f)
+
+            # initialize parameters
+            net.initialize()
+            netg.initialize()
+
+            net(*inputs)
+
+            for p1, p2 in zip(net.collect_params().values(), netg.collect_params().values()):
+                p2.set_data(p1.data())
+
+            netg.hybridize(static_alloc=True, static_shape=True)
+
+            print("Testing inference mode")
+            with random_seed(seed):
+                for _ in range(N):
+                    assert_almost_equal(net(*inputs), netg(*inputsg))
+
+            mx.nd.waitall()
+            print("Testing training mode")
+            for _ in range(N):
+                with random_seed(seed):
+                    with mx.autograd.record():
+                        out = net(*inputs)
+                    out.backward()
+
+                with random_seed(seed):
+                    with mx.autograd.record():
+                        outg = netg(*inputsg)
+                    outg.backward()
+
+                assert_almost_equal(out, outg)
+                for i, ig in zip(inputs, inputsg):
+                    assert_almost_equal(i.grad, ig.grad)
+
+                for p1, p2 in zip(net.collect_params().values(), netg.collect_params().values()):
+                    assert_almost_equal(p1.data(), p2.data())
+                    if p1.grad_req != 'null':
+                        assert_almost_equal(p1.grad(), p2.grad())
+            mx.nd.waitall()
+
+@with_seed()
+def test_cudnn_dropout_reproducibility():
+    d = nn.Dropout(0.5)
+    d.initialize()
+    a = mx.random.uniform(shape=(100,100))
+    b = a.copy()
+    a.attach_grad()
+    b.attach_grad()
+    seed = np.random.randint(0, 100000)
+    N = 10
+    mx.random.seed(seed)
+    out1 = []
+    for _ in range(N):
+        with autograd.record():
+            out1.append(d(a))
+    out1[0].backward()
+    mx.random.seed(seed)
+    out2 = []
+    for _ in range(N):
+        with autograd.record():
+            out2.append(d(b))
+    out2[0].backward()
+
+    for first, second in zip(out1, out2):
+        assert_almost_equal(first, second)
+
+    assert_almost_equal(a.grad, b.grad)
+
+
+if __name__ == '__main__':
+    import nose
+    nose.runmodule()
